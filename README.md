@@ -84,7 +84,7 @@ It supports:
 
 ### User Interface
 - 16×2 HD44780 LCD  
-- LCD powered from A3 for full shutdown during sleep  
+- LCD powered from A3 allowing full shutdown during sleep  
 - Four buttons: Up, Down, Left, Right  
 - Menu system:
   - Home  
