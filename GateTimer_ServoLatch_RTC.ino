@@ -837,7 +837,7 @@ long readVcc() {
 }
 
 
-bool servoOpenWithRetry(int maxRetries = 20) {
+bool servoOpenWithRetry(int maxRetries = 10) {
 
   auto attemptOpen = [&](int attemptNum) -> bool {
     releaseServo.attach(servoPin);
@@ -849,7 +849,7 @@ bool servoOpenWithRetry(int maxRetries = 20) {
     int delayMs = 10;          // starting speed
     const int minDelay = 5;    // fastest allowed
     const int maxDelay = 50;   // slowest allowed
-    const int targetDrop = 300;
+    const int targetDrop = 400;
 
     if (attemptNum > 2 && !servoIsOpen) {
       for (int i = 0; i < 5; i++) {
@@ -878,7 +878,7 @@ bool servoOpenWithRetry(int maxRetries = 20) {
         // too much load → slow down
         delayMs += 5;
         if (delayMs > maxDelay) delayMs = maxDelay;
-      } else if (drop < targetDrop - 20) {
+      } else if (drop < targetDrop ) {
         // plenty of headroom → speed up
         delayMs -= 2;
         if (delayMs < minDelay) delayMs = minDelay;
@@ -892,7 +892,20 @@ bool servoOpenWithRetry(int maxRetries = 20) {
       }
     }
 
-    delay(800 * tempMulti);
+    unsigned long start = millis();
+    unsigned long timeout = 3000UL * tempMulti;
+
+    while (millis() - start < timeout) {
+      delay(50);
+      long v = readVcc();
+
+      if (baseline - v <= 20) {
+      break;
+      }
+    }
+
+    delay(50);
+
     long endVcc = readVcc();
     releaseServo.detach();
 
@@ -1045,7 +1058,7 @@ bool safeCloseServo() {
         // Reached closed position
         if (pos_c == servoClosed) {
           servoIsOpen = false;
-          delay(800 * tempMulti);
+          delay(1000 * tempMulti);
           releaseServo.detach();
           return true;
         }
@@ -1423,7 +1436,7 @@ void loop() {
     delay(10);
     DateTime now = rtc.now();
     currentTempC = rtc.getTemperature();
-    tempMulti = (currentTempC < -8.0f) ? 3 : (currentTempC <   0.0f) ? 2 : 1;
+    tempMulti = (currentTempC < -12 ? 4 : currentTempC < -6 ? 3 : currentTempC < 0 ? 2 : 1);
 
     // Countdown check
     if (lockActive && now >= endTime) {
