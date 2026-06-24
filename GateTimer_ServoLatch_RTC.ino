@@ -33,6 +33,7 @@ const int servoPower = A2;     // servo power mosfet gate
 const int servoOpen = 95;     // adjust for your mechanism
 const int servoClosed = 47;    // adjust for your mechanism
 bool servoIsOpen = false;   // tracks manual servo state
+bool firstopen = true;
 static bool comboHandled = false;
 long overloadDrop = 50;
 long tempMulti = 1;
@@ -169,6 +170,17 @@ static unsigned int optionsHelpPos = 0;
 static unsigned long lastOptionsScroll = 0;
 const unsigned long optionsScrollIntervalMs = 300;
 
+// --- Gate Test Mode (minimal patch) ---
+bool gateTestMode = false;
+int gateTestCycle = 0;          // how many cycles completed
+const int gateTestTotal = 10;   // 10 minutes = 10 cycles
+DateTime gateTestNext;          // next scheduled cycle
+int gateTestSuccess = 0;
+int gateTestFail = 0;
+long gateTestMaxDrop = 0;       // worst stress (max Vcc drop)
+DateTime cachedNow;
+
+
 // Sleep tracking using RTC
 DateTime lastwelcome;
 
@@ -196,8 +208,8 @@ void setupWatchdog8s() {
 
 void setup() {
   // Servo Power Off On Startup
-  pinMode(servoPower, INPUT);
-  digitalWrite(servoPower, LOW);
+  pinMode(servoPower, OUTPUT);
+  digitalWrite(servoPower, HIGH);
 
   // Daily triggers init
   for (int t = 0; t < 5; t++) {
@@ -242,6 +254,12 @@ void setup() {
 
   setupWatchdog8s();
   sei();
+
+  ADCSRA |= _BV(ADEN);
+  for (int i = 0; i < 4; i++) {
+      readVcc();
+      delay(5);
+  }
 
   menuState = HOME;
   refreshLCD();
@@ -416,7 +434,7 @@ void handleUp() {
       break;
 
     case DIAGNOSTICS:
-      diagIndex = (diagIndex + 5) % 6;
+      diagIndex = (diagIndex + 6) % 7;
       break; 
 
     case MODE_SELECT:
@@ -426,7 +444,7 @@ void handleUp() {
 
     case OPTIONS:
       if (!optionsEditMode) {
-        optionsFieldIndex = (optionsFieldIndex + 1) % 5; // cycle up
+        optionsFieldIndex = (optionsFieldIndex + 1) % 6; // cycle up
       } else {
         if (optionsFieldIndex == 0) {          // Timeout
           sleepTimeoutMs += 1000;
@@ -495,7 +513,7 @@ void handleDown() {
       break;
     
     case DIAGNOSTICS:
-      diagIndex = (diagIndex + 1) % 6;
+      diagIndex = (diagIndex + 1) % 7;
       break;     
 
     case MODE_SELECT:
@@ -505,7 +523,7 @@ void handleDown() {
 
     case OPTIONS:
       if (!optionsEditMode) {
-        optionsFieldIndex = (optionsFieldIndex + 4) % 5;
+        optionsFieldIndex = (optionsFieldIndex + 5) % 6;
       } else {
         if (optionsFieldIndex == 0) {          // Timeout
           sleepTimeoutMs -= 1000;
@@ -625,8 +643,35 @@ void handleRight() {
         } else if (optionsFieldIndex == 4) {
           // Exit Options -> Home
           menuState = HOME;
+        } else if (optionsFieldIndex == 5) {
+          // Toggle Gate Test Mode
+          gateTestMode = !gateTestMode;
+
+          if (gateTestMode) {
+            DateTime now = rtc.now();
+            gateTestCycle = 0;
+            gateTestSuccess = 0;
+            gateTestFail = 0;
+            gateTestMaxDrop = 0;
+            gateTestNext = now + TimeSpan(0,0,1,0);  // first cycle in 1 minute
+          }
+
+          menuState = HOME;
+          if(gateTestMode){
+            lcd.clear();
+            lcd.setCursor(0,0); lcd.print("Gate Test Mode");
+            lcd.setCursor(0,1); lcd.print("Activated!");
+            lastMessageStart = millis();
+            showingMessage = true;
+          } else {
+            lcd.clear();
+            lcd.setCursor(0,0); lcd.print("Gate Test Mode");
+            lcd.setCursor(0,1); lcd.print("Deactivated!");
+            lastMessageStart = millis();
+            showingMessage = true;            
+          }
         }
-      } else {
+        } else {
         // In edit mode: Right exits edit mode (same as Left)
         optionsEditMode = false;
       }
@@ -836,21 +881,77 @@ long readVcc() {
   return vcc;
 }
 
+void resetServoRail() {
+
+  // Fully cut power to servo rail
+  pinMode(servoPower, OUTPUT);
+  digitalWrite(servoPower, LOW);
+  delay(300);   // allow servo MCU to fully brown-out
+
+  // Re-enable power
+  digitalWrite(servoPower, HIGH);
+  delay(200);   // allow internal MCU to boot
+
+  // Reattach servo
+  releaseServo.attach(servoPin);
+  delay(150);
+
+  // Small wake-up wiggle
+  releaseServo.write(servoClosed);
+  delay(200);
+  releaseServo.write(servoClosed + 10);
+  delay(200);
+  releaseServo.write(servoClosed);
+  delay(200);
+
+  releaseServo.detach();
+}
+
 
 bool servoOpenWithRetry(int maxRetries = 10) {
 
+  // --- Ensure power and ADC are ON ---
+  pinMode(servoPower, OUTPUT);
+  digitalWrite(servoPower, HIGH);
+  delay(120);
+
+  PRR &= ~_BV(PRADC);
+  ADCSRA |= _BV(ADEN);
+  delay(50);
+
   auto attemptOpen = [&](int attemptNum) -> bool {
+
+    // --- Attach ONCE per attempt ---
     releaseServo.attach(servoPin);
-    delay(300);
-    long baseline = readVcc();
+    delay(200);
+
+    // --- First-open stabilisation (runs only once) ---
+    if (firstopen) {
+      releaseServo.write((servoClosed + servoOpen) / 2);
+      delay(400);
+      safeCloseServo();
+      firstopen = false;
+      delay(150);
+    }
+
+    // --- Baseline Vcc ---
+    long baseline = 0;
+    for (int i = 0; i < 5; i++) {
+      baseline += readVcc();
+      delay(5);
+    }
+    baseline /= 5;
+
     long dropSum = 0;
     long maxDrop = 0;
-    int  samples = 0;
-    int delayMs = 10;          // starting speed
-    const int minDelay = 5;    // fastest allowed
-    const int maxDelay = 50;   // slowest allowed
+    int samples = 0;
+
+    int delayMs = 10;
+    const int minDelay = 5;
+    const int maxDelay = 50;
     const int targetDrop = 400;
 
+    // --- Stiction routine only after attempt 2 ---
     if (attemptNum > 2 && !servoIsOpen) {
       for (int i = 0; i < 5; i++) {
         releaseServo.write(servoClosed + 2);
@@ -867,23 +968,22 @@ bool servoOpenWithRetry(int maxRetries = 10) {
       delay(120);
     }
 
+    // --- Sweep from closed → open ---
     for (int pos = servoClosed; pos <= servoOpen; pos++) {
       releaseServo.write(pos);
       delay(delayMs);
 
       long vccNow = readVcc();
       long drop = baseline - vccNow;
-      // --- Adaptive speed control ---
-      if (drop > targetDrop ) {
-        // too much load → slow down
+
+      // Adaptive speed
+      if (drop > targetDrop) {
         delayMs += 5;
         if (delayMs > maxDelay) delayMs = maxDelay;
-      } else if (drop < targetDrop ) {
-        // plenty of headroom → speed up
+      } else {
         delayMs -= 2;
         if (delayMs < minDelay) delayMs = minDelay;
       }
-
 
       if (drop > 0) {
         dropSum += drop;
@@ -892,48 +992,70 @@ bool servoOpenWithRetry(int maxRetries = 10) {
       }
     }
 
+    // --- Recovery detection ---
     unsigned long start = millis();
     unsigned long timeout = 3000UL * tempMulti;
+
+    long avgDrop = (samples > 0) ? dropSum / samples : 0;
+    long thresh_opened = max(30L, avgDrop / 4);
+
+    const int W = 5;
+    long window[W] = {0};
+    int idx = 0;
+    int filled = 0;
+    long sum = 0;
+    bool recovered = false;
 
     while (millis() - start < timeout) {
       delay(50);
       long v = readVcc();
+      long drop = baseline - v;
 
-      if (baseline - v <= 20) {
-      break;
+      sum -= window[idx];
+      window[idx] = drop;
+      sum += drop;
+      idx = (idx + 1) % W;
+
+      if (filled < W) filled++;
+
+      long movAvg = sum / filled;
+      if (movAvg <= thresh_opened) {
+        recovered = true;
+        break;
       }
     }
 
-    delay(50);
+    delay(150);
 
     long endVcc = readVcc();
+
+    // --- Detach ONCE per attempt ---
     releaseServo.detach();
 
-    long avgDrop = (samples > 0) ? dropSum / samples : 0;
-
-    // Updated thresholds for your system
-    bool moved      = avgDrop > 20;     // servo definitely drew current
-    bool recovered  = baseline - endVcc <= 20;     // Vcc bounced back
-
+    bool moved = avgDrop > 30;
     bool success = moved && recovered;
-
-    if (success){
-    lastSuccessVcc = baseline;
-    lastSuccessAvg = avgDrop;
-    lastSuccessEnd = baseline - endVcc;
-    lastSuccessAttempt = attemptNum;
-    lastSuccessTemp = currentTempC;
-    lastOutcome = OUT_LOCK_OPENED;
-    } else {
-    lastFailVcc = baseline;
-    lastFailAvg = avgDrop;
-    lastFailEnd = baseline - endVcc;
-    lastFailAttempt = attemptNum;
-    lastFailTemp = currentTempC;
-    lastOutcome = OUT_NONE;  
+    if (!moved) {
+      resetServoRail();
     }
 
-    // LCD diagnostics for this attempt
+    // --- Record stats ---
+    if (success) {
+      lastSuccessVcc = baseline;
+      lastSuccessAvg = avgDrop;
+      lastSuccessEnd = baseline - endVcc;
+      lastSuccessAttempt = attemptNum;
+      lastSuccessTemp = currentTempC;
+      lastOutcome = OUT_LOCK_OPENED;
+    } else {
+      lastFailVcc = baseline;
+      lastFailAvg = avgDrop;
+      lastFailEnd = baseline - endVcc;
+      lastFailAttempt = attemptNum;
+      lastFailTemp = currentTempC;
+      lastOutcome = OUT_NONE;
+    }
+
+    // --- LCD diagnostics ---
     if (displayActive && lcdReady) {
       lcd.clear();
       lcd.setCursor(0,0);
@@ -973,7 +1095,7 @@ bool servoOpenWithRetry(int maxRetries = 10) {
       return true;
     }
 
-    // --- Failed attempt: close safely before retrying ---
+    // Failed attempt → safe close
     safeCloseServo();
     delay(300);
   }
@@ -986,39 +1108,56 @@ bool servoOpenWithRetry(int maxRetries = 10) {
     delay(2000);
     refreshLCD();
   }
-  
+
   lastOutcome = OUT_FAIL_MAX;
   return false;
 }
 
 
-bool safeCloseServo() {
-  const int maxRetries     = 3;
-  const int maxRetries_c   = 10;
-  lastClose_overload    = false;
 
+bool safeCloseServo() {
+
+  // --- Ensure power and ADC are ON ---
+  pinMode(servoPower, OUTPUT);
+  digitalWrite(servoPower, HIGH);
+  delay(120);
+
+  PRR &= ~_BV(PRADC);
+  ADCSRA |= _BV(ADEN);
+  delay(50);
+
+  const int maxRetries   = 3;
+  const int maxRetries_c = 10;
+
+  lastClose_overload = false;
+
+  // --- Attach ONCE per outer attempt ---
   releaseServo.attach(servoPin);
+  delay(150);
 
   for (int attempt = 0; attempt < maxRetries; attempt++) {
 
     long baselineVcc = readVcc();
 
-      // --- ADAPTIVE THRESHOLD BASED ONLY ON LAST SUCCESS ---
-    long adaptiveThreshold = lastSuccessAvg + overloadDrop;
+    // Adaptive threshold based on last success
+    long adaptiveThreshold =
+        (lastSuccessAvg == 0 ? 200 : lastSuccessAvg) + overloadDrop;
 
-      // Reset diagnostics
+    // Reset diagnostics
     lastClose_avgDrop     = 0;
     lastClose_maxDrop     = 0;
-        
     lastClose_adaptiveThr = adaptiveThreshold;
+
     long totalDrop = 0;
     int  samples   = 0;
+
     int pos_c = servoOpen;
     int attempt_c = 0;
-    // --- INNER RETRIES FOR THE ACTUAL CLOSING MOTION ---
-    retry_close:
-    if ( attempt_c < maxRetries_c) {
-      attempt_c++;  
+
+    // --- INNER RETRY LOOP (no re-attach) ---
+    while (attempt_c < maxRetries_c) {
+      attempt_c++;
+
       for (; pos_c >= servoClosed; pos_c--) {
 
         releaseServo.write(pos_c);
@@ -1028,61 +1167,82 @@ bool safeCloseServo() {
         long drop   = baselineVcc - vccNow;
 
         // Track max drop
-        if (drop > lastClose_maxDrop) {
+        if (drop > lastClose_maxDrop)
           lastClose_maxDrop = drop;
-        }
 
-        // Track avg drop dynamically
-        if (drop >= 0 ) {
-        totalDrop += drop;
-        samples++;
-        lastClose_avgDrop = totalDrop / samples;
+        // Track avg drop
+        if (drop >= 0) {
+          totalDrop += drop;
+          samples++;
+          lastClose_avgDrop = totalDrop / samples;
         }
 
         // Overload detection
         if (drop > adaptiveThreshold && pos_c < servoOpen - 3) {
           lastClose_overload = true;
+
           int backpos = pos_c + 16;
-          if (backpos > servoOpen) {
+          if (backpos > servoOpen)
             backpos = servoOpen;
-          }
+
           for (int back = pos_c; back <= backpos; back++) {
             releaseServo.write(back);
             delay(10);
           }
+
           pos_c = backpos;
           delay(200);
-          goto retry_close;
+
+          // retry inner loop WITHOUT re-attaching
+          goto retry_inner;
         }
 
         // Reached closed position
         if (pos_c == servoClosed) {
           servoIsOpen = false;
-          delay(1000 * tempMulti);
+          delay(800 * tempMulti);
           releaseServo.detach();
           return true;
         }
       }
+
+      retry_inner:;
     }
 
-    // Full reopen before outer retry
+    // --- Full reopen before next outer retry ---
     for (int back = pos_c; back <= servoOpen; back++) {
       releaseServo.write(back);
       delay(10);
     }
-    delay(2000);
+    delay(600);
   }
 
+  // --- All attempts failed ---
   releaseServo.detach();
   return false;
 }
 
 
+
 void triggerLock() {
-  if (!displayActive && !lcdReady) {
+
+  // --- Ensure full wake from sleep (even if watchdog woke us) ---
+  if (!displayActive || !lcdReady) {
     stagedRestoreAfterButtonWake();
   }
 
+  // Restore all peripherals that sleep disabled
+  PRR &= ~(_BV(PRADC) | _BV(PRSPI) | _BV(PRTWI) | _BV(PRTIM1) | _BV(PRTIM2));
+  ACSR &= ~_BV(ACD);
+  ADCSRA |= _BV(ADEN);
+  delay(50);
+
+  // Ensure servo power MOSFET is ON
+  pinMode(servoPower, OUTPUT);
+  digitalWrite(servoPower, HIGH);
+  delay(120);
+
+  // UI feedback
   lcd.clear();
   lcd.setCursor(0,0); lcd.print("Gate Triggered!");
   lastMessageStart = millis();
@@ -1090,27 +1250,27 @@ void triggerLock() {
 
   // Attach servo
   releaseServo.attach(servoPin);
+  delay(150);
 
-  // open latch
-  servoOpenWithRetry();
+  // --- OPEN LATCH ---
+  bool openedOK = servoOpenWithRetry();
 
   delay(5000);
 
-  // close latch
+  // --- CLOSE LATCH ---
   bool closedOK = safeCloseServo();
+
   if (!closedOK) {
     lcd.clear();
     lcd.setCursor(0,0); lcd.print("Latch Overload!");
     lcd.setCursor(0,1); lcd.print("Check mechanism");
     delay(4000);
   }
-  
-
 
   // Detach to save power
   releaseServo.detach();
-
 }
+
 
 bool getNextGateTime(int &outHour, int &outMinute) {
   DateTime now = rtc.now();
@@ -1138,6 +1298,79 @@ bool getNextGateTime(int &outHour, int &outMinute) {
   return found;
 }
 
+void handleGateTestMode() {
+
+  if (!gateTestMode)
+    return;
+
+  // Completed?
+  if (gateTestCycle >= gateTestTotal) {
+    gateTestMode = false;
+    return;
+  }
+
+  // Time to run next cycle?
+  if (cachedNow.hour() == gateTestNext.hour() &&
+      cachedNow.minute() == gateTestNext.minute()) {
+
+    gateTestCycle++;
+    gateTestNext = gateTestNext + TimeSpan(0,0,1,0); // next minute
+
+    // Wake system if needed
+    if (!displayActive || !lcdReady) {
+      stagedRestoreAfterButtonWake();
+    }
+
+    // Restore peripherals for servo operation
+    PRR &= ~(_BV(PRADC) | _BV(PRSPI) | _BV(PRTWI) | _BV(PRTIM1) | _BV(PRTIM2));
+    ACSR &= ~_BV(ACD);
+    ADCSRA |= _BV(ADEN);
+    delay(50);
+
+    // Ensure servo power MOSFET is ON
+    pinMode(servoPower, OUTPUT);
+    digitalWrite(servoPower, HIGH);
+    delay(120);
+
+    // UI feedback
+    lcd.clear();
+    lcd.setCursor(0,0); lcd.print("Gate Test!");
+    lastMessageStart = millis();
+    showingMessage = true;
+
+    // Perform open/close cycle
+    bool opened = servoOpenWithRetry();
+    delay(1000);
+    bool closed = safeCloseServo();
+
+    if (opened && closed) gateTestSuccess++;
+    else gateTestFail++;
+
+    if (lastClose_maxDrop > gateTestMaxDrop)
+      gateTestMaxDrop = lastClose_maxDrop;
+
+    // LCD feedback
+    if (displayActive && lcdReady) {
+      lcd.clear();
+      lcd.setCursor(0,0);
+      lcd.print("Test ");
+      lcd.print(gateTestCycle);
+      lcd.print("/");
+      lcd.print(gateTestTotal);
+
+      lcd.setCursor(0,1);
+      lcd.print("OK:");
+      lcd.print(gateTestSuccess);
+      lcd.print(" NG:");
+      lcd.print(gateTestFail);
+      delay(600);
+    }
+  }
+}
+
+
+
+
 // --- Part 7: LCD Refresh ---
 
 void refreshLCD() {
@@ -1152,12 +1385,16 @@ void refreshLCD() {
   switch (menuState) {
     case HOME: {
       // Alternate between Battery and Time every 3s
-      static int homeScreenMode = 0;  // 0=battery, 1=time, 2=next gate
+      static int homeScreenMode = 0;  // 0=battery, 1=time, 2=next gate, 3=test mode
 
       unsigned long interval = (currentTempC < 0.0f) ? 6000UL : 3000UL;
 
       if (millis() - lastAlt >= interval) {
-        homeScreenMode = (homeScreenMode + 1) % 3;
+        if (gateTestMode){
+          homeScreenMode = (homeScreenMode + 1) % 4;
+        } else{
+          homeScreenMode = (homeScreenMode + 1) % 3;
+        }
         lastAlt = millis();
       }
 
@@ -1188,7 +1425,13 @@ void refreshLCD() {
         } else {
           lcd.print("All Times OFF");
         }
+      } else if (homeScreenMode == 3 && gateTestMode) {
+        lcd.print("Gate Test ");
+        lcd.print(gateTestCycle);
+        lcd.print("/");
+        lcd.print(gateTestTotal);
       }
+
 
       lcd.setCursor(0,1);
       if (lockActive) {
@@ -1252,6 +1495,8 @@ void refreshLCD() {
         lcd.print("Reset GateTimes");
       } else if (optionsFieldIndex == 4) {
         lcd.print("Exit Options");
+      } else if (optionsFieldIndex == 5) {
+        lcd.print("Gate Test Mode");
       }
 
       if (optionsEditMode && (optionsFieldIndex == 0 || optionsFieldIndex == 1)) {
@@ -1409,6 +1654,18 @@ void refreshLCD() {
         lcd.print("To Exit Press");
         lcd.setCursor(0,1);
         lcd.print("Right or Left");
+      } else if (diagIndex == 6) {
+        lcd.setCursor(0,0);
+        lcd.print("GT ");
+        lcd.print(gateTestCycle);
+        lcd.print("/");
+        lcd.print(gateTestTotal);
+
+        lcd.setCursor(0,1);
+        lcd.print("OK:");
+        lcd.print(gateTestSuccess);
+        lcd.print(" NG:");
+        lcd.print(gateTestFail);
       }
 
       break;
@@ -1421,22 +1678,31 @@ void refreshLCD() {
 // --- Part 8: Main Loop ---
 
 void loop() {
+
+  // Wake from button
   if (wokeFromButton) {
     stagedRestoreAfterButtonWake();
     sleeping = false;
     wokeFromButton = false;
   }
 
+  // --- Watchdog Tick ---
   if (watchdogTick) {
     watchdogTick = false;
 
-    // Re‑enable TWI/I²C temporarily to talk to RTC
+    // Re-enable TWI/I²C temporarily to talk to RTC
     PRR &= ~_BV(PRTWI);
     Wire.begin();
     delay(10);
+
+    // Read RTC once per tick
     DateTime now = rtc.now();
+    cachedNow = now;
+
     currentTempC = rtc.getTemperature();
-    tempMulti = (currentTempC < -12 ? 4 : currentTempC < -6 ? 3 : currentTempC < 0 ? 2 : 1);
+    tempMulti = (currentTempC < -12 ? 4 :
+                 currentTempC < -6  ? 3 :
+                 currentTempC < 0   ? 2 : 1);
 
     // Countdown check
     if (lockActive && now >= endTime) {
@@ -1444,9 +1710,10 @@ void loop() {
       triggerLock();
     }
 
-    // Daily triggers check
+    // Daily triggers
     for (int t = 0; t < 5; t++) {
       DailyTrigger &tr = dailyTriggers[t];
+
       if (tr.enabled &&
           now.hour() == tr.hour &&
           now.minute() == tr.minute &&
@@ -1454,6 +1721,7 @@ void loop() {
         triggerLock();
         tr.triggered = true;
       }
+
       if (tr.enabled &&
          (now.hour() != tr.hour || now.minute() != tr.minute) &&
           tr.triggered) {
@@ -1461,56 +1729,52 @@ void loop() {
       }
     }
 
+    // Running countdown screen refresh
     if (displayActive && lcdReady && menuState == RUNNING_COUNTDOWN) {
       refreshLCD();
     }
   }
 
-  // Buttons
+  // --- Buttons ---
   checkButton(btnDown, 0, handleDown);
   checkButton(btnUp,   1, handleUp);
   checkButton(btnLeft, 2, handleLeft);
   checkButton(btnRight,3, handleRight);
 
-  // Combo: Up + Down -> toggle servo state safely
+  // Combo: Up + Down → toggle servo state
   if (digitalRead(btnUp) == LOW && digitalRead(btnDown) == LOW) {
 
+    if (!comboHandled) {
+      comboHandled = true;
 
-      if (!comboHandled) {
-        comboHandled = true;
-
-        // Wake display if needed
-        if (!displayActive || !lcdReady) {
-          stagedRestoreAfterButtonWake();
-        }
-
-        if (servoIsOpen) {
-          // Try safe close
-          bool ok = safeCloseServo();
-          if (!ok) {
-            lcd.clear();
-            lcd.setCursor(0,0); lcd.print("Latch Overload!");
-            lcd.setCursor(0,1); lcd.print("Check Mechanism");
-            delay(1500);
-          } else {
-            lcd.clear();
-            lcd.setCursor(0,0); lcd.print("Latch CLOSED");
-            delay(600);
-          }
-        } else {
-          // Open normally
-          servoOpenWithRetry();
-
-        }
-
-        refreshLCD();
+      if (!displayActive || !lcdReady) {
+        stagedRestoreAfterButtonWake();
       }
+
+      if (servoIsOpen) {
+        bool ok = safeCloseServo();
+        if (!ok) {
+          lcd.clear();
+          lcd.setCursor(0,0); lcd.print("Latch Overload!");
+          lcd.setCursor(0,1); lcd.print("Check Mechanism");
+          delay(1500);
+        } else {
+          lcd.clear();
+          lcd.setCursor(0,0); lcd.print("Latch CLOSED");
+          delay(600);
+        }
+      } else {
+        servoOpenWithRetry();
+      }
+
+      refreshLCD();
+    }
 
   } else {
     comboHandled = false;
   }
 
-  // OPTIONS help scroll (only when awake and not too close to sleep)
+  // OPTIONS help scroll
   if (millis() - lastButtonPress < (sleepTimeoutMs - 500)) {
     if (menuState == OPTIONS && displayActive && lcdReady && !optionsEditMode) {
       if (millis() - lastOptionsScroll >= optionsScrollIntervalMs) {
@@ -1523,15 +1787,19 @@ void loop() {
     }
   }
 
+  // --- Gate Test Mode ---
+  handleGateTestMode();
+
+  // Menu state change
   if (menuState != lastState) {
     if (displayActive && lcdReady) refreshLCD();
     lastState = menuState;
   }
 
-
+  // Timed message clear
   if (showingMessage && millis() - lastMessageStart >= 2000) {
     showingMessage = false;
-    // After messages, return to sensible place
+
     if (menuState == OPTIONS ||
         menuState == CONFIRM_RESET_COUNTDOWN ||
         menuState == CONFIRM_RESET_GATETIMES) {
@@ -1539,24 +1807,26 @@ void loop() {
     } else {
       menuState = HOME;
     }
+
     refreshLCD();
   }
 
+  // Refresh if needed
   if (needsRefresh && displayActive && lcdReady) {
     refreshLCD();
     needsRefresh = false;
   }
 
-  if (WakeMessageCheck && displayActive && lcdReady){
+  // Wake message
+  if (WakeMessageCheck && displayActive && lcdReady) {
     welcomeMessage = true;
     showWelcomeAfterLongSleepIfNeeded();
     WakeMessageCheck = false;
     welcomeMessage = false;
     lastwelcome = rtc.now();
   }
-  
 
-  // Periodic HOME refresh for time / battery / running display
+  // Periodic HOME refresh
   static unsigned long lastRefresh = 0;
   if (menuState == HOME && displayActive && lcdReady) {
     if (millis() - lastRefresh >= 1000) {
@@ -1565,7 +1835,7 @@ void loop() {
     }
   }
 
-  // Sleep logic
+  // --- Sleep Logic ---
   if (millis() - lastButtonPress >= sleepTimeoutMs) {
     sleeping = true;
     preparePinsForSleep();
@@ -1584,4 +1854,3 @@ void loop() {
     sleep_disable();
   }
 }
-
