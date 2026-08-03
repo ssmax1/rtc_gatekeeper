@@ -2,12 +2,14 @@
 
 Low‑power ATmega328P gate‑timer system with DS3231 RTC, LCD UI, deep sleep, countdown mode, and daily scheduled triggers.
 
-This repository contains **two firmware variants**, each supporting the same timing/UI/sleep system but using different latch‑actuation hardware:
+This repository contains **three firmware variants**, each supporting the same timing/UI/sleep system but using different latch‑actuation hardware:
 
 - **Servo‑driven latch**  
   (`GateTimer_ServoLatch_RTC.ino`)
 - **Pulsed nitinol/SMA latch**  
   (`GateTimer_NitinolLatch_RTC.ino`)
+  - **Latch Detection Servo and Nitinol/SMA types**  
+  (`GateKeeperRTC_LatchDetect.ino`)
 
 ---
 ## IMPORTANT HARDWARE NOTE — LCD Backlight Resistor
@@ -47,7 +49,15 @@ Features:
 - Multi‑attempt retry scheduling with increasing pulse duration  
 - Diagnostics for avg drop, max drop, open time, quickest/slowest opens
 
-Both variants share the same UI, RTC timing, sleep behaviour, and daily trigger logic.
+### 3. Latch Detection Servo and Nitinol/SMA types  
+**File:** `GateKeeperRTC_LatchDetect.ino`
+
+Designed for a **either Nitinol or Servo** latch types.
+
+Features:
+- Combined features of firmware 1 + 2 with automatic detection of the latch type in use by load signature.
+- Persistent memory of gate times automatically stored and recovered on reset or after power loss (EEPROM)
+- Improved ram usage, crash prevention and hang recovery with custom 8mhz board and optiboot bootloader
 
 ---
 
@@ -129,8 +139,10 @@ ATmega328P (bare chip or Arduino‑compatible)
 | Variant | Output Pin | Description |
 |--------|-------------|-------------|
 | **Servo** | Pin 5 | Servo signal |
-|          | A2 | Servo power MOSFET gate |
-| **Nitinol** | A2 | Pulse output to SMA wire |
+| **Servo** | A2 | Servo power MOSFET gate |
+| **Nitinol** | Pin 5 | Not used |
+| **Nitinol** | A2 | Pulse power MOSFET gate output to SMA wire |
+
 
 ### Shared Outputs
 - LCD VCC control on A3  
@@ -141,7 +153,7 @@ ATmega328P (bare chip or Arduino‑compatible)
 ## Menu System
 
 ### Home
-- Alternates between battery voltage, current time, and next gate time  
+- Alternates between battery voltage, current time, and next gate time / gate time summary
 - Shows countdown status if active  
 - Right enters Mode Select  
 - Left enters Diagnostics
@@ -158,7 +170,7 @@ ATmega328P (bare chip or Arduino‑compatible)
 
 ### Gate Times
 - Five triggers  
-- Hour, minute, enabled state  
+- Hour, minute, enabled state
 
 ### Options
 Servo variant:
@@ -206,7 +218,7 @@ Variant‑specific latch diagnostics (servo or nitinol)
 
 ## Notes
 
-- Both variants use the same menu/UI codebase for consistency.  
-- Choose the firmware that matches your latch hardware.  
+- All variants use the same menu/UI codebase for consistency.  
+- Choose the firmware that matches your latch hardware or needs.  
 - Servo variant includes adaptive torque and safe‑close logic.  
 - Nitinol variant includes pulse‑based open detection and retry scheduling.
