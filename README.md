@@ -8,7 +8,7 @@ This repository contains **three firmware variants**, each supporting the same t
   (`GateTimer_ServoLatch_RTC.ino`)
 - **Pulsed nitinol/SMA latch**  
   (`GateTimer_NitinolLatch_RTC.ino`)
-  - **Latch Detection Servo and Nitinol/SMA types**  
+- **Latch Detection Servo and Nitinol/SMA types**  
   (`GateKeeperRTC_LatchDetect.ino`)
 
 ---
