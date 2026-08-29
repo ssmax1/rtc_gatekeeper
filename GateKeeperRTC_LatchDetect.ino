@@ -164,6 +164,7 @@ volatile bool watchdogTick = false;
 volatile int wdtCounter = 0;
 volatile bool blinkLED = false;
 volatile bool statusLEDon = false;
+volatile uint8_t wdtStuckCounter = 0; // Software-enforced hard reset watchdog counter
 
 volatile bool wokeFromButton = false;
 
@@ -271,6 +272,15 @@ ISR(WDT_vect) {
   if (wdtCounter >= 8) {
     wdtCounter = 0;
     blinkLED = true;     // Signal loop to blink Pin 13
+  }
+
+  // Fallback hardware hard-reset if main loop locks up and fails to clear counter
+  wdtStuckCounter++;
+  if (wdtStuckCounter >= 3) {
+    MCUSR = 0;
+    WDTCSR |= _BV(WDCE) | _BV(WDE);
+    WDTCSR = _BV(WDE); // Enable system reset mode, immediate timeout
+    while(1);
   }
 }
 
@@ -1428,24 +1438,28 @@ void updatePulse() {
   }
 }
 
-bool getNextGateTime(int &outHour, int &outMinute, String &outFormattedList) {
+bool getNextGateTime(int &outHour, int &outMinute, char* outFormattedList, size_t maxLen) {
   DateTime now = rtc.now();
   int nowMinutes = now.hour() * 60 + now.minute();
 
   int bestDiff = 24 * 60 + 1;  
   bool found = false;
 
-  outFormattedList = "T";
+  // Safely initialize the stack buffer using PROGMEM format
+  snprintf_P(outFormattedList, maxLen, PSTR("T"));
 
   for (int t = 0; t < 5; t++) {
     DailyTrigger &tr = dailyTriggers[t];
 
-    outFormattedList += " ";
+    char timeBuf[8];
     if (tr.enabled) {
-      if (tr.hour < 10) outFormattedList += "0";
-      outFormattedList += tr.hour;
+      snprintf_P(timeBuf, sizeof(timeBuf), PSTR(" %02d"), tr.hour);
     } else {
-      outFormattedList += "--";
+      snprintf_P(timeBuf, sizeof(timeBuf), PSTR(" --"));
+    }
+    
+    if (strlen(outFormattedList) + strlen(timeBuf) < maxLen) {
+      strcat(outFormattedList, timeBuf);
     }
 
     if (!tr.enabled) continue;
@@ -1518,9 +1532,9 @@ void refreshLCD() {
       } 
       else if (homeScreenMode == 2) {
         int nh, nm;
-        String gateListStr;
+        char gateListStr[20]; // Stack buffer, completely eliminating heap fragmentation
         
-        if (getNextGateTime(nh, nm, gateListStr)) {
+        if (getNextGateTime(nh, nm, gateListStr, sizeof(gateListStr))) {
           lcd.print(F("Next Gate "));
           printTwoDigits(nh); 
           lcd.print(':'); 
@@ -1746,6 +1760,7 @@ void refreshLCD() {
 
 void loop() {
   wdt_reset();
+  wdtStuckCounter = 0; // Clear stuck counter, proving main loop is healthy and executing
 
   if (wokeFromButton) {
     stagedRestoreAfterButtonWake();
