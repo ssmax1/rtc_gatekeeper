@@ -709,10 +709,6 @@ void handleRight() {
         lcd.clear();
         lcd.setCursor(0,0); lcd.print(F("Resets Cleared!"));
         delay(1000);
-      } if (diagIndex == 6) {
-        lcd.clear();
-        lcd.setCursor(0,0); lcd.print(F("Fail Reset Test!"));
-        while(1);
       } else {
         menuState = HOME;
       }
