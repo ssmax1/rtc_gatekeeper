@@ -22,7 +22,7 @@ bool eepromPendingSave = false;
 int wdtSaveTicks = 0;
 
 // Reset tracking
-uint8_t storedResetFlags = 0;
+uint8_t storedResetFlags __attribute__((section(".noinit")));
 int watchdogResetCount = 0;
 
 // On-board LED Pin
@@ -164,7 +164,9 @@ volatile bool watchdogTick = false;
 volatile int wdtCounter = 0;
 volatile bool blinkLED = false;
 volatile bool statusLEDon = false;
-volatile uint8_t wdtStuckCounter = 0; // Software-enforced hard reset watchdog counter
+
+volatile uint8_t wdtOK = 0;
+#define WDT_OK_TOKEN 0x5A
 
 volatile bool wokeFromButton = false;
 
@@ -238,10 +240,12 @@ enum LockType {
 LockType activeLockType = LOCK_UNKNOWN;
 const int lockDetectThreshold = 200;
 
-// Capture MCUSR early before anything wipes it
-void __attribute__((naked)) __attribute__((used)) __init3(void) {
+// Capture MCUSR and disable watchdog early before anything wipes it
+void __attribute__((naked)) __attribute__((used)) __attribute__((section(".init3"))) mcusr_init(void) {
   storedResetFlags = MCUSR;
   MCUSR = 0;
+  WDTCSR |= _BV(WDCE) | _BV(WDE);
+  WDTCSR = 0;
 }
 
 // EEPROM Helper Functions
@@ -265,8 +269,8 @@ void loadGateTimesFromEEPROM() {
 // --- Part 2: Watchdog, ISRs, Setup ---
 
 ISR(WDT_vect) {
+
   watchdogTick = true;
-  WDTCSR |= (1 << WDIE); // Re-arm Watchdog interrupt bit
 
   wdtCounter++;
   if (wdtCounter >= 8) {
@@ -274,32 +278,37 @@ ISR(WDT_vect) {
     blinkLED = true;     // Signal loop to blink Pin 13
   }
 
-  // Fallback hardware hard-reset if main loop locks up and fails to clear counter
-  wdtStuckCounter++;
-  if (wdtStuckCounter >= 3) {
-    MCUSR = 0;
-    WDTCSR |= _BV(WDCE) | _BV(WDE);
-    WDTCSR = _BV(WDE); // Enable system reset mode, immediate timeout
-    while(1);
+  if (wdtOK == WDT_OK_TOKEN) {
+    wdtOK = 0; // Reset token for the next cycle
+    // Re-enable WDE to force a system reset if loop() stops feeding it
+    WDTCSR |= _BV(WDIE) | _BV(WDE); 
   }
+  
 }
 
 void wakeISR() {
   if (sleeping) {
     wokeFromButton = true;
     WakeMessageCheck = true;
-  }  
+  }
   lastButtonPress = millis();
 }
 
 void setupWatchdog8s() {
   MCUSR = 0;
   WDTCSR |= (1 << WDCE) | (1 << WDE);
-  // Enable BOTH System Reset (WDE) and Interrupt (WDIE) with 8s timeout
-  WDTCSR = (1 << WDE) | (1 << WDIE) | (1 << WDP3) | (1 << WDP0); 
+  // Enable ONLY Interrupt (WDIE) with 8s timeout, leaving WDE disabled
+  WDTCSR = (1 << WDIE) | (1 << WDP3) | (1 << WDP0);
 }
 
 void setup() {
+  // Ensure WDT is turned off immediately upon entering setup
+  MCUSR = 0;
+  WDTCSR |= _BV(WDCE) | _BV(WDE);
+  WDTCSR = 0;
+
+  PRR = 0;
+
   // Pin 13 LED setup
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, LOW);
@@ -314,7 +323,7 @@ void setup() {
     watchdogResetCount = 0;
   }
 
-  // Check if last boot was a Watchdog crash
+  // Check if last boot was a Watchdog crash via hardware WDRF flag
   if (storedResetFlags & (1 << WDRF)) {
     watchdogResetCount++;
     EEPROM.put(EEPROM_RESETCOUNT_ADDR, watchdogResetCount);
@@ -432,13 +441,13 @@ void showWelcomeAfterLongSleepIfNeeded() {
     lcd.setCursor(0,1);  lcd.write(byte(0)); lcd.print(F(" Portvogteren ")); lcd.write(byte(0));
     delay(1500);
   }
-} 
+}
 
 void stagedRestoreAfterButtonWake() {
   cli();
 
-  // Re-enable peripherals
-  PRR   &= ~(_BV(PRADC) | _BV(PRSPI) | _BV(PRTWI) | _BV(PRTIM1) | _BV(PRTIM2));
+  // Re-enable all peripherals completely via PRR reset
+  PRR = 0;
   ACSR  &= ~_BV(ACD);
   ADCSRA |= _BV(ADEN);
 
@@ -550,7 +559,7 @@ void handleUp() {
     case HOME: break;
     case DIAGNOSTICS:
       diagIndex = (diagIndex + 1) % 7;
-      break; 
+      break;
     case MODE_SELECT:
       fieldIndex = (fieldIndex + 1) % 4;
       break;
@@ -621,7 +630,7 @@ void handleDown() {
     case HOME: break;
     case DIAGNOSTICS:
       diagIndex = (diagIndex + 6) % 7;
-      break;     
+      break;
     case MODE_SELECT:
       fieldIndex = (fieldIndex + 3) % 4;
       break;
@@ -700,11 +709,15 @@ void handleRight() {
         lcd.clear();
         lcd.setCursor(0,0); lcd.print(F("Resets Cleared!"));
         delay(1000);
+      } if (diagIndex == 6) {
+        lcd.clear();
+        lcd.setCursor(0,0); lcd.print(F("Fail Reset Test!"));
+        while(1);
       } else {
         menuState = HOME;
       }
       needsRefresh = true;
-      break;    
+      break;
     case MODE_SELECT:
       if (fieldIndex == 0) {
         menuState = SET_GATETIMES;
@@ -884,10 +897,10 @@ bool runSweepCheck(long baseline, int currentAngle, int targetAngle) {
   while (millis() - startCheck < 35) {
     wdt_reset();
     long currentDrop = baseline - readVcc();
-    if (currentDrop >= servoDetectThreshold) return true; 
+    if (currentDrop >= servoDetectThreshold) return true;
   }
   releaseServo.write(currentAngle);
-  delay(30); 
+  delay(30);
   return false;
 }
 
@@ -906,7 +919,7 @@ LockType determineConnectedLock() {
 
   pinMode(latchPower, OUTPUT);
   digitalWrite(latchPower, HIGH);
-  delay(10); 
+  delay(10);
   long testVcc1 = readVcc();
   digitalWrite(latchPower, LOW);
 
@@ -916,8 +929,8 @@ LockType determineConnectedLock() {
   }
 
   pinMode(latchPower, OUTPUT);
-  digitalWrite(latchPower, HIGH); 
-  delay(15); 
+  digitalWrite(latchPower, HIGH);
+  delay(15);
 
   releaseServo.attach(servoPin);
   int startAngle = servoIsOpen ? servoOpen : servoClosed;
@@ -928,12 +941,12 @@ LockType determineConnectedLock() {
   if (!servoDetected) {
     releaseServo.detach();
     digitalWrite(servoPin, LOW);
-    resetServoRail(); 
-    
+    resetServoRail();
+
     pinMode(latchPower, OUTPUT);
-    digitalWrite(latchPower, HIGH); 
-    delay(15); 
-    
+    digitalWrite(latchPower, HIGH);
+    delay(15);
+
     releaseServo.attach(servoPin);
     servoDetected = runSweepCheck(baseline, startAngle, targetAngle);
   }
@@ -950,16 +963,16 @@ LockType determineConnectedLock() {
   lcd.setCursor(0, 1); lcd.print(F("Reconnect Latch!"));
   delay(3000);
 
-  return LOCK_MONO_PULSE; 
+  return LOCK_MONO_PULSE;
 }
 
 void resetServoRail() {
   pinMode(latchPower, OUTPUT);
   digitalWrite(latchPower, LOW);
-  delay(300);   
+  delay(300);
 
   digitalWrite(latchPower, HIGH);
-  delay(200);   
+  delay(200);
 
   releaseServo.attach(servoPin);
   delay(150);
@@ -1006,7 +1019,7 @@ bool servoOpenWithRetry(int currentMaxRetries = 5) {
 
     if (attemptNum > 2 && !servoIsOpen) {
       for (int i = 0; i < 5; i++) {
-        wdt_reset();
+        wdt_reset(); 
         releaseServo.write(servoClosed + 2);
         delay(40);
         releaseServo.write(servoClosed);
@@ -1021,7 +1034,7 @@ bool servoOpenWithRetry(int currentMaxRetries = 5) {
     }
 
     for (int pos = servoClosed; pos <= servoOpen; pos++) {
-      wdt_reset();
+      wdt_reset(); 
       releaseServo.write(pos);
       delay(delayMs);
 
@@ -1057,7 +1070,7 @@ bool servoOpenWithRetry(int currentMaxRetries = 5) {
     bool recovered = false;
 
     while (millis() - start < timeout) {
-      wdt_reset();
+      wdt_reset(); 
       delay(50);
       long v = readVcc();
       long drop = baseline - v;
@@ -1118,7 +1131,7 @@ bool servoOpenWithRetry(int currentMaxRetries = 5) {
   };
 
   for (int attempt = 1; attempt <= currentMaxRetries; attempt++) {
-    wdt_reset();
+    wdt_reset(); 
     if (attemptOpen(attempt)) {
       servoIsOpen = true;
       if (displayActive && lcdReady) {
@@ -1164,7 +1177,7 @@ bool safeCloseServo() {
   delay(150);
 
   for (int attempt = 0; attempt < maxRetries; attempt++) {
-    wdt_reset();
+    wdt_reset(); 
     long baselineVcc = readVcc();
     long adaptiveThreshold = (lastSuccessAvg == 0 ? 70 : lastSuccessAvg) + OverloadCloseOpenDelta;
 
@@ -1182,7 +1195,7 @@ bool safeCloseServo() {
       attempt_c++;
 
       for (; pos_c >= servoClosed; pos_c--) {
-        wdt_reset();
+        wdt_reset(); 
         releaseServo.write(pos_c);
         delay(25 * tempMulti);
 
@@ -1204,7 +1217,7 @@ bool safeCloseServo() {
           if (backpos > servoOpen) backpos = servoOpen;
 
           for (int back = pos_c; back <= backpos; back++) {
-            wdt_reset();
+            wdt_reset(); 
             releaseServo.write(back);
             delay(10);
           }
@@ -1225,7 +1238,7 @@ bool safeCloseServo() {
     }
 
     for (int back = pos_c; back <= servoOpen; back++) {
-      wdt_reset();
+      wdt_reset(); 
       releaseServo.write(back);
       delay(10);
     }
@@ -1301,7 +1314,7 @@ void triggerLock() {
 }
 
 void updatePulse() {
-  wdt_reset();
+  wdt_reset(); 
   unsigned long now = millis();
 
   if (!pulseActive && retryScheduled && rtc.now() >= retryAtRTC) {
@@ -1341,11 +1354,11 @@ void updatePulse() {
       lcd.print(F(" d")); lcd.print(drop);
       lastMessageStart = millis();
       showingMessage = true;
-      return; 
+      return;
     }
-    
+
     if (pulseDurationMs - openTimeMs > 50) {
-      pulseDurationMs = openTimeMs + 50;   
+      pulseDurationMs = openTimeMs + 50;
       if (pulseDurationMs < 50) pulseDurationMs = 50;
     }
 
@@ -1383,7 +1396,7 @@ void updatePulse() {
     } else {
       lcd.print(F(" d")); lcd.print(drop - voltageThreshold);
     }
-    delay(2500);    
+    delay(2500);
     lastMessageStart = millis();
     showingMessage = true;
     return;
@@ -1418,9 +1431,9 @@ void updatePulse() {
         lastMessageStart = millis();
         return;
       }
-      
+
       retryCount++;
-      retryAtRTC = rtc.now() + TimeSpan(0, 0, 0, 15);  
+      retryAtRTC = rtc.now() + TimeSpan(0, 0, 0, 15);
       retryScheduled = true;
 
       lcd.clear();
@@ -1430,7 +1443,7 @@ void updatePulse() {
 
       lcd.setCursor(0,1);
       lcd.print(F("Retry ")); lcd.print(retryCount); lcd.print(F(" in 15s"));
-      
+
       delay(2500);
       lastMessageStart = millis();
       showingMessage = true;
@@ -1442,7 +1455,7 @@ bool getNextGateTime(int &outHour, int &outMinute, char* outFormattedList, size_
   DateTime now = rtc.now();
   int nowMinutes = now.hour() * 60 + now.minute();
 
-  int bestDiff = 24 * 60 + 1;  
+  int bestDiff = 24 * 60 + 1;
   bool found = false;
 
   // Safely initialize the stack buffer using PROGMEM format
@@ -1457,7 +1470,7 @@ bool getNextGateTime(int &outHour, int &outMinute, char* outFormattedList, size_
     } else {
       snprintf_P(timeBuf, sizeof(timeBuf), PSTR(" --"));
     }
-    
+
     if (strlen(outFormattedList) + strlen(timeBuf) < maxLen) {
       strcat(outFormattedList, timeBuf);
     }
@@ -1466,7 +1479,7 @@ bool getNextGateTime(int &outHour, int &outMinute, char* outFormattedList, size_
 
     int triggerMinutes = tr.hour * 60 + tr.minute;
     int diff = triggerMinutes - nowMinutes;
-    if (diff < 0) diff += 24 * 60;  
+    if (diff < 0) diff += 24 * 60;
 
     if (diff < bestDiff) {
       bestDiff = diff;
@@ -1504,7 +1517,7 @@ void refreshLCD() {
 
   switch (menuState) {
     case HOME: {
-      static int homeScreenMode = 0;  
+      static int homeScreenMode = 0;
       unsigned long interval = (currentTempC < 0.0f) ? 6000UL : 3000UL;
 
       if (millis() - lastAlt >= interval) {
@@ -1513,42 +1526,42 @@ void refreshLCD() {
       }
 
       lcd.setCursor(0, 0);
-      
+
       if (homeScreenMode == 0) {
         long vcc = readVcc();
         float tC = currentTempC;
-        lcd.print(F("B ")); 
+        lcd.print(F("B "));
         lcd.print(vcc / 1000.0, 2);
-        lcd.print(F("v T ")); 
-        lcd.print(tC, 1); 
+        lcd.print(F("v T "));
+        lcd.print(tC, 1);
         lcd.print(F("c    "));
-      } 
+      }
       else if (homeScreenMode == 1) {
         lcd.print(F("Time "));
         printTwoDigits(now.hour());   lcd.print(':');
         printTwoDigits(now.minute()); lcd.print(':');
         printTwoDigits(now.second());
         lcd.print(F("   "));
-      } 
+      }
       else if (homeScreenMode == 2) {
         int nh, nm;
         char gateListStr[20]; // Stack buffer, completely eliminating heap fragmentation
-        
+
         if (getNextGateTime(nh, nm, gateListStr, sizeof(gateListStr))) {
           lcd.print(F("Next Gate "));
-          printTwoDigits(nh); 
-          lcd.print(':'); 
+          printTwoDigits(nh);
+          lcd.print(':');
           printTwoDigits(nm);
         } else {
           lcd.print(F("All Times OFF   "));
         }
-        
+
         lcd.setCursor(0, 1);
-        lcd.print(gateListStr); 
+        lcd.print(gateListStr);
       }
 
       lcd.setCursor(0, 1);
-        
+
       if (lockActive) {
         long total = endTime.unixtime() - now.unixtime();
         if (total > 0) {
@@ -1556,7 +1569,7 @@ void refreshLCD() {
           int hh = (total % 86400) / 3600;
           int mm = (total % 3600) / 60;
           int ss = total % 60;
-          
+
           lcd.print(F("Run "));
           printThreeDigits(dd); lcd.print(':');
           printTwoDigits(hh);   lcd.print(':');
@@ -1639,11 +1652,11 @@ void refreshLCD() {
       printTwoDigits(setSeconds);
       lcd.setCursor(14,1); lcd.print(F("Go"));
 
-      if (fieldIndex == 0)      lcd.setCursor(0,1);   
-      else if (fieldIndex == 1) lcd.setCursor(4,1);   
-      else if (fieldIndex == 2) lcd.setCursor(7,1);   
-      else if (fieldIndex == 3) lcd.setCursor(10,1);  
-      else if (fieldIndex == 4) lcd.setCursor(14,1);  
+      if (fieldIndex == 0)      lcd.setCursor(0,1);
+      else if (fieldIndex == 1) lcd.setCursor(4,1);
+      else if (fieldIndex == 2) lcd.setCursor(7,1);
+      else if (fieldIndex == 3) lcd.setCursor(10,1);
+      else if (fieldIndex == 4) lcd.setCursor(14,1);
       lcd.cursor();
       break;
     }
@@ -1657,9 +1670,9 @@ void refreshLCD() {
       printTwoDigits(tr.minute);
       lcd.print(tr.enabled ? F("  -> On") : F("  -> Off"));
 
-      if (fieldIndex == 0)      lcd.setCursor(0,1);   
-      else if (fieldIndex == 1) lcd.setCursor(3,1);   
-      else if (fieldIndex == 2) lcd.setCursor(10,1);  
+      if (fieldIndex == 0)      lcd.setCursor(0,1);
+      else if (fieldIndex == 1) lcd.setCursor(3,1);
+      else if (fieldIndex == 2) lcd.setCursor(10,1);
       lcd.cursor();
       break;
     }
@@ -1726,7 +1739,7 @@ void refreshLCD() {
         if (activeLockType == LOCK_MONO_PULSE) {
           lcd.print(F(" T ")); lcd.print(lastSuccessOpenMs); lcd.print(F("ms"));
         } else {
-          lcd.print(F(" Attempt ")); lcd.print(lastSuccessAttempt);          
+          lcd.print(F(" Attempt ")); lcd.print(lastSuccessAttempt);
         }
       } else if (diagIndex == 2) {
         lcd.setCursor(0,0); lcd.print(F("VF ")); lcd.print(lastFailVcc); lcd.print(F(" AF ")); lcd.print(lastFailAvg);
@@ -1739,7 +1752,7 @@ void refreshLCD() {
       } else if (diagIndex == 3) {
         lcd.setCursor(0,0); lcd.print(F("Last Okay:")); lcd.print(lastSuccessTemp, 1); lcd.print(F("c"));
         lcd.setCursor(0,1); lcd.print(F("Last Fail:")); lcd.print(lastFailTemp, 1); lcd.print(F("c"));
-      } else if (diagIndex == 4) {        
+      } else if (diagIndex == 4) {
         lcd.clear();
         lcd.setCursor(0,0); lcd.print(F("C avg ")); lcd.print(lastClose_avgDrop); lcd.print(F(" t ")); lcd.print(lastClose_adaptiveThr);
         lcd.setCursor(0,1); lcd.print(F("mx ")); lcd.print(lastClose_maxDrop); lcd.print(F(" OL:")); lcd.print(lastClose_overload ? F("Y") : F("N"));
@@ -1759,15 +1772,15 @@ void refreshLCD() {
 // --- Part 8: Main Loop ---
 
 void loop() {
-  wdt_reset();
-  wdtStuckCounter = 0; // Clear stuck counter, proving main loop is healthy and executing
+  wdt_reset(); 
+  
 
   if (wokeFromButton) {
     stagedRestoreAfterButtonWake();
     sleeping = false;
     wokeFromButton = false;
   }
-  
+
   // --- LED Blink for Every 4th WDT ---
   if (blinkLED && sleeping && !statusLEDon) {
     blinkLED = false;
@@ -1775,16 +1788,16 @@ void loop() {
     int enabledCount = getEnabledTriggerCount();
     for (int i = 0; i < enabledCount; i++) {
       digitalWrite(ledPin, HIGH);
-      delay(75); 
+      delay(75);
       digitalWrite(ledPin, LOW);
-      delay(200); 
+      delay(200);
     }
   }
 
   // --- Watchdog Tick ---
   if (watchdogTick) {
     watchdogTick = false;
-    
+
     if (getEnabledTriggerCount() > 0) {
       digitalWrite(ledPin, statusLEDon = !statusLEDon);
     }
@@ -1853,10 +1866,10 @@ void loop() {
       if (!displayActive || !lcdReady) stagedRestoreAfterButtonWake();
       if (!pulseActive && !lockActive) activeLockType = determineConnectedLock();
 
-      if (activeLockType == LOCK_MONO_PULSE && !pulseActive && !lockActive && nitinolReady) {          
+      if (activeLockType == LOCK_MONO_PULSE && !pulseActive && !lockActive && nitinolReady) {
         delay(300);
         DateTime now = rtc.now();
-        endTime = now + TimeSpan(0, 0, 0, 2);   
+        endTime = now + TimeSpan(0, 0, 0, 2);
         lockActive = true;
         pulseManualActive = true;
         menuState = HOME;
@@ -1950,4 +1963,7 @@ void loop() {
     sleep_cpu();
     sleep_disable();
   }
+
+  wdtOK = WDT_OK_TOKEN;
+
 }
