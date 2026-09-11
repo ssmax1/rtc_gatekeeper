@@ -20,6 +20,7 @@ const int EEPROM_RESETCOUNT_ADDR = 105;
 // Deferred save tracking driven strictly by WDT
 bool eepromPendingSave = false;
 int wdtSaveTicks = 0;
+int servoOpenTicks = 0;
 
 // Reset tracking
 uint8_t storedResetFlags __attribute__((section(".noinit")));
@@ -109,6 +110,7 @@ const int servoOpen = 95;     // adjust for your mechanism
 const int servoClosed = 47;    // adjust for your mechanism
 const int servoDetectThreshold = 20;
 bool servoIsOpen = false;   // tracks manual servo state
+bool servoOpened = false; // manual opened combo press
 static bool comboHandled = false;
 long OverloadCloseOpenDelta = 0;
 long tempMulti = 1;
@@ -428,18 +430,18 @@ void showWelcomeAfterLongSleepIfNeeded() {
   DateTime wakeRTC = rtc.now();
   TimeSpan slept = wakeRTC - lastwelcome;
 
-  if (slept.totalseconds() > 300 ) {  // > 5 mins
+  if (currentTempC > 4 && slept.totalseconds() > 300 ) {  // > 5 mins
     byte heartBuf[8];
     memcpy_P(heartBuf, heart, 8);
     lcd.createChar(0, heartBuf);
     lcd.clear();
     lcd.setCursor(0,0); lcd.write(byte(0)); lcd.print(F(" Welcome   To ")); lcd.write(byte(0));
     lcd.setCursor(0,1); lcd.write(byte(0)); lcd.print(F(" Gate  Keeper ")); lcd.write(byte(0));
-    delay(1500);
+    delay(1000);
     lcd.clear();
     lcd.setCursor(0,0);  lcd.write(byte(0)); lcd.print(F("Velkommen  Til")); lcd.write(byte(0));
     lcd.setCursor(0,1);  lcd.write(byte(0)); lcd.print(F(" Portvogteren ")); lcd.write(byte(0));
-    delay(1500);
+    delay(1000);
   }
 }
 
@@ -1225,6 +1227,7 @@ bool safeCloseServo() {
 
         if (pos_c == servoClosed) {
           servoIsOpen = false;
+          servoOpened = false;
           delay(800 * tempMulti);
           releaseServo.detach();
           return true;
@@ -1243,6 +1246,7 @@ bool safeCloseServo() {
 
   releaseServo.detach();
   return false;
+  servoOpenTicks = 0;
 }
 
 void update_Vthresh(long avgDrop) {
@@ -1808,6 +1812,16 @@ void loop() {
       }
     }
 
+    if (servoOpened) {
+        servoOpenTicks++;
+      if (servoOpenTicks >= 2) {
+        stagedRestoreAfterButtonWake();
+        delay(200);
+        safeCloseServo();
+        servoOpenTicks = 0;
+      }    
+    }
+
     PRR &= ~_BV(PRTWI);
     Wire.begin();
     delay(10);
@@ -1884,6 +1898,8 @@ void loop() {
           }
         } else {
           servoOpenWithRetry();
+          servoOpened = true;
+          servoOpenTicks = 0;
         }
       }
       refreshLCD();
