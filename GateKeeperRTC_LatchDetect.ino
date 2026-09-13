@@ -16,11 +16,16 @@ const int EEPROM_GATETIMES_ADDR = 0;
 const uint8_t EEPROM_VALID_KEY = 0xA5;
 const int EEPROM_MAGIC_ADDR    = 100;
 const int EEPROM_RESETCOUNT_ADDR = 105;
+const int EEPROM_SERVO_OPEN_ADDR   = 110;
+const int EEPROM_SERVO_CLOSED_ADDR = 112;
+const int EEPROM_SERVO_MAGIC_ADDR  = 114;
+const uint8_t EEPROM_SERVO_KEY     = 0x5B;
 
 // Deferred save tracking driven strictly by WDT
-bool eepromPendingSave = false;
+bool gateTimesPendingSave = false;
+bool servoPendingSave = false;
 int wdtSaveTicks = 0;
-int servoOpenTicks = 0;
+int servoOpenTicks = 0;;
 
 // Reset tracking
 uint8_t storedResetFlags __attribute__((section(".noinit")));
@@ -106,8 +111,8 @@ long worstOpenVcc = 0;
 // Single Servo
 Servo releaseServo;
 const int servoPin = 5;        // signal pin
-const int servoOpen = 95;     // adjust for your mechanism
-const int servoClosed = 47;    // adjust for your mechanism
+int servoOpen = 95;     // adjust for your mechanism
+int servoClosed = 47;    // adjust for your mechanism
 const int servoDetectThreshold = 20;
 bool servoIsOpen = false;   // tracks manual servo state
 bool servoOpened = false; // manual opened combo press
@@ -267,6 +272,23 @@ void loadGateTimesFromEEPROM() {
   }
 }
 
+void saveServoSettingsToEEPROM() {
+  EEPROM.put(EEPROM_SERVO_OPEN_ADDR, servoOpen);
+  EEPROM.put(EEPROM_SERVO_CLOSED_ADDR, servoClosed);
+  EEPROM.update(EEPROM_SERVO_MAGIC_ADDR, EEPROM_SERVO_KEY);
+}
+
+void loadServoSettingsFromEEPROM() {
+  if (EEPROM.read(EEPROM_SERVO_MAGIC_ADDR) == EEPROM_SERVO_KEY) {
+    EEPROM.get(EEPROM_SERVO_OPEN_ADDR, servoOpen);
+    EEPROM.get(EEPROM_SERVO_CLOSED_ADDR, servoClosed);
+  } else {
+    // Fallback defaults if EEPROM has not been initialized yet
+    servoOpen = 95;
+    servoClosed = 47;
+    saveServoSettingsToEEPROM();
+  }
+}
 
 // --- Part 2: Watchdog, ISRs, Setup ---
 
@@ -331,8 +353,9 @@ void setup() {
     EEPROM.put(EEPROM_RESETCOUNT_ADDR, watchdogResetCount);
   }
 
-  // Load Gate Times from EEPROM
+  // Load Gate Times and Servo Angles from EEPROM
   loadGateTimesFromEEPROM();
+  loadServoSettingsFromEEPROM();
 
   // Power LCD on at startup
   pinMode(lcdVccPin, OUTPUT);
@@ -567,7 +590,7 @@ void handleUp() {
       break;
     case OPTIONS:
       if (!optionsEditMode) {
-        optionsFieldIndex = (optionsFieldIndex + 1) % 7;
+        optionsFieldIndex = (optionsFieldIndex + 1) % 9;
       } else {
         if (optionsFieldIndex == 0) {
           sleepTimeoutMs += 1000;
@@ -581,6 +604,16 @@ void handleUp() {
         } else if (optionsFieldIndex == 3) {
           OverloadCloseOpenDelta += 10;
           if (OverloadCloseOpenDelta > 50) OverloadCloseOpenDelta = 0;
+        } else if (optionsFieldIndex == 4) {
+          servoOpen += 1;
+          if (servoOpen > 180) servoOpen = 180;
+          servoPendingSave = true;
+          wdtSaveTicks = 0;
+        } else if (optionsFieldIndex == 5) {
+          servoClosed += 1;
+          if (servoClosed > 180) servoClosed = 180;
+          servoPendingSave = true;
+          wdtSaveTicks = 0;
         }
       }
       break;
@@ -610,7 +643,7 @@ void handleUp() {
       tr.triggered = false;
 
       // Flag pending deferred save & reset WDT save counter
-      eepromPendingSave = true;
+      gateTimesPendingSave = true;
       wdtSaveTicks = 0;
       break;
     }
@@ -638,7 +671,7 @@ void handleDown() {
       break;
     case OPTIONS:
       if (!optionsEditMode) {
-        optionsFieldIndex = (optionsFieldIndex + 6) % 7;
+        optionsFieldIndex = (optionsFieldIndex + 8) % 9;
       } else {
         if (optionsFieldIndex == 0) {
           sleepTimeoutMs -= 1000;
@@ -652,6 +685,16 @@ void handleDown() {
         } else if (optionsFieldIndex == 3) {
           OverloadCloseOpenDelta -= 10;
           if (OverloadCloseOpenDelta < 0) OverloadCloseOpenDelta = 50;
+        } else if (optionsFieldIndex == 4) {
+          servoOpen -= 1;
+          if (servoOpen < 0) servoOpen = 0;
+          servoPendingSave = true;
+          wdtSaveTicks = 0;
+        } else if (optionsFieldIndex == 5) {
+          servoClosed -= 1;
+          if (servoClosed < 0) servoClosed = 0;
+          servoPendingSave = true;
+          wdtSaveTicks = 0;
         }
       }
       break;
@@ -681,7 +724,7 @@ void handleDown() {
       tr.triggered = false;
 
       // Flag pending deferred save & reset WDT save counter
-      eepromPendingSave = true;
+      gateTimesPendingSave = true;
       wdtSaveTicks = 0;
       break;
     }
@@ -742,15 +785,15 @@ void handleRight() {
       break;
     case OPTIONS:
       if (!optionsEditMode) {
-        if (optionsFieldIndex <= 3) {
+        if (optionsFieldIndex <= 5) {
           optionsEditMode = true;
-        } else if (optionsFieldIndex == 4) {
+        } else if (optionsFieldIndex == 6) {
           menuState = CONFIRM_RESET_COUNTDOWN;
           cancelChoice = false;
-        } else if (optionsFieldIndex == 5) {
+        } else if (optionsFieldIndex == 7) {
           menuState = CONFIRM_RESET_GATETIMES;
           cancelChoice = false;
-        } else if (optionsFieldIndex == 6) {
+        } else if (optionsFieldIndex == 8) {
           menuState = HOME;
         }
       } else {
@@ -777,7 +820,7 @@ void handleRight() {
       if (cancelChoice) {
         for (int t = 0; t < 5; t++) dailyTriggers[t] = {0,0,false,false};
         saveGateTimesToEEPROM(); // Clear EEPROM
-        eepromPendingSave = false;
+        gateTimesPendingSave = false;
         wdtSaveTicks = 0;
 
         lcd.setCursor(0,0); lcd.print(F("Gate Times have"));
@@ -1617,14 +1660,18 @@ void refreshLCD() {
       } else if (optionsFieldIndex == 3) {
         lcd.print(F("CloseOvLoad ")); lcd.print(OverloadCloseOpenDelta); lcd.print(F("mV"));
       } else if (optionsFieldIndex == 4) {
-        lcd.print(F("Reset Countdown"));
+        lcd.print(F("Servo Open ")); lcd.print(servoOpen); lcd.print(F("deg"));
       } else if (optionsFieldIndex == 5) {
-        lcd.print(F("Reset GateTimes"));
+        lcd.print(F("Servo Closed ")); lcd.print(servoClosed); lcd.print(F("deg"));
       } else if (optionsFieldIndex == 6) {
+        lcd.print(F("Reset Countdown"));
+      } else if (optionsFieldIndex == 7) {
+        lcd.print(F("Reset GateTimes"));
+      } else if (optionsFieldIndex == 8) {
         lcd.print(F("Exit Options"));
       }
 
-      if (optionsEditMode && optionsFieldIndex <= 3) {
+      if (optionsEditMode && optionsFieldIndex <= 5) {
         lcd.setCursor(14,1);
         lcd.print(F("<>"));
       }
@@ -1803,11 +1850,17 @@ void loop() {
     }
 
     // --- Deferred EEPROM Save logic ---
-    if (eepromPendingSave) {
+    if (gateTimesPendingSave || servoPendingSave) {
       wdtSaveTicks++;
       if (wdtSaveTicks >= 4) {
-        saveGateTimesToEEPROM();
-        eepromPendingSave = false;
+        if (gateTimesPendingSave) {
+          saveGateTimesToEEPROM();
+          gateTimesPendingSave = false;
+        }
+        if (servoPendingSave) {
+          saveServoSettingsToEEPROM();
+          servoPendingSave = false;
+        }
         wdtSaveTicks = 0;
       }
     }
